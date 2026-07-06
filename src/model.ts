@@ -1,11 +1,21 @@
-import type { RealmBeatmap, RealmDump } from "./api";
+// Sidebar model — mirrors the Rust `ManiaSetDto`/`ManiaDiffDto` (realm.rs).
+// The grouping is done in Rust (`read_mania_library`); this is just the shape.
+
+export interface DiffMeta {
+	title: string;
+	titleUnicode: string;
+	artist: string;
+	author: string;
+}
 
 export interface ManiaDiff {
 	hash: string;
 	name: string;
 	stars: number;
 	keyCount: number;
-	beatmap: RealmBeatmap;
+	audioHash?: string; // content hash of the song's audio file, if resolvable
+	audioFile?: string; // audio filename (for MIME), e.g. "audio.mp3"
+	meta: DiffMeta;
 }
 
 export interface ManiaSet {
@@ -15,45 +25,4 @@ export interface ManiaSet {
 	artist: string;
 	author: string;
 	difficulties: ManiaDiff[];
-}
-
-/** Group mania difficulties into sets, dropping non-mania and empty sets. */
-export function buildManiaSets(dump: RealmDump): ManiaSet[] {
-	const byId = new Map<string, RealmBeatmap>();
-	for (const b of dump.Beatmap ?? []) byId.set(b.ID, b);
-
-	const sets: ManiaSet[] = [];
-	for (const set of dump.BeatmapSet ?? []) {
-		const diffs: ManiaDiff[] = [];
-		for (const ref of set.Beatmaps ?? []) {
-			const b = byId.get(ref._pk);
-			if (!b || b.Ruleset?._pk !== "mania") continue;
-			diffs.push({
-				hash: b.Hash,
-				name: b.DifficultyName,
-				stars: b.StarRating,
-				keyCount: Math.round(b.Difficulty?.CircleSize ?? 0),
-				beatmap: b,
-			});
-		}
-		if (diffs.length === 0) continue;
-
-		diffs.sort((a, b) => a.stars - b.stars);
-		const meta = diffs[0].beatmap.Metadata;
-		const romanized = meta?.Title ?? "";
-		sets.push({
-			id: set.ID,
-			title: meta?.TitleUnicode || romanized || "(unknown)",
-			titleRomanized: romanized,
-			artist: meta?.Artist ?? "",
-			author: meta?.Author?.Username ?? "",
-			difficulties: diffs,
-		});
-	}
-
-	// sort by the romanized title so latin ordering is intuitive
-	sets.sort((a, b) =>
-		(a.titleRomanized || a.title).localeCompare(b.titleRomanized || b.title),
-	);
-	return sets;
 }

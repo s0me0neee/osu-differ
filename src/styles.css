@@ -225,10 +225,23 @@ body {
 .detail-header {
 	margin-bottom: 22px;
 }
+.detail-title-row {
+	display: flex;
+	align-items: baseline;
+	gap: 14px;
+}
 .detail-title {
 	font-size: 26px;
 	font-weight: 800;
 	letter-spacing: -0.01em;
+	min-width: 0;
+}
+.detail-stars {
+	flex: none;
+	font-size: 18px;
+	font-weight: 700;
+	font-family: var(--mono);
+	color: #ffcf6a;
 }
 .detail-sub {
 	font-size: 13px;
@@ -249,15 +262,17 @@ body {
 
 .stat-grid {
 	display: grid;
-	grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
-	gap: 10px;
+	grid-auto-flow: column;
+	grid-auto-columns: 1fr;
+	gap: 6px;
 	margin-bottom: 8px;
 }
 .stat {
+	min-width: 0;
 	background: var(--bg-raise);
 	border: 1px solid var(--line);
-	border-radius: 12px;
-	padding: 14px 16px;
+	border-radius: 9px;
+	padding: 8px 9px;
 	transition: transform 0.14s ease, border-color 0.14s ease,
 		background 0.14s ease, box-shadow 0.14s ease;
 }
@@ -268,16 +283,22 @@ body {
 	box-shadow: 0 6px 18px rgba(255, 102, 170, 0.12);
 }
 .stat-value {
-	font-size: 20px;
+	font-size: 15px;
 	font-weight: 700;
 	font-family: var(--mono);
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 .stat-label {
-	font-size: 11px;
+	font-size: 9px;
 	color: var(--text-faint);
 	text-transform: uppercase;
-	letter-spacing: 0.06em;
-	margin-top: 4px;
+	letter-spacing: 0.04em;
+	margin-top: 3px;
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
 }
 
 .section-title {
@@ -388,8 +409,49 @@ body {
 	cursor: pointer;
 	transition: color 0.12s ease, border-color 0.12s ease;
 }
-.chart-btn:hover {
+.chart-btn:hover:not(:disabled) {
 	color: var(--text);
+	border-color: var(--accent-dim);
+}
+.chart-btn:disabled {
+	opacity: 0.4;
+	cursor: default;
+}
+.chart-toggle.on {
+	color: var(--accent);
+	border-color: var(--accent);
+	background: rgba(255, 102, 170, 0.12);
+}
+
+.chart-controls {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+.chart-speed-wrap {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+}
+.chart-speed-label {
+	font-size: 11px;
+	font-family: var(--mono);
+	color: var(--text-faint);
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+.chart-speed {
+	width: 48px;
+	font-size: 12px;
+	font-family: var(--mono);
+	color: var(--text);
+	background: var(--bg-raise-2);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	padding: 4px 6px;
+	outline: none;
+}
+.chart-speed:focus {
 	border-color: var(--accent-dim);
 }
 
@@ -401,26 +463,55 @@ body {
 .chart-viewport {
 	position: absolute;
 	inset: 0;
-	overflow: auto;
+	overflow-y: auto;
+	overflow-x: hidden;
+}
+
+/* decorated scrollbar — doubles as a progress bar during playback */
+.chart-viewport::-webkit-scrollbar {
+	width: 13px;
+}
+.chart-viewport::-webkit-scrollbar-track {
+	background: linear-gradient(180deg, rgba(255, 102, 170, 0.06), rgba(0, 0, 0, 0.25));
+	border-left: 1px solid var(--line);
+}
+.chart-viewport::-webkit-scrollbar-thumb {
+	background: linear-gradient(180deg, var(--accent), var(--accent-dim));
+	border-radius: 8px;
+	border: 3px solid #161016;
+	min-height: 40px;
+}
+.chart-viewport::-webkit-scrollbar-thumb:hover {
+	background: linear-gradient(180deg, #ff8cc0, var(--accent));
+}
+/* brighter, glowing thumb while the song is playing */
+.chart-panel.playing .chart-viewport::-webkit-scrollbar-thumb {
+	background: linear-gradient(180deg, #ffd0e8, var(--accent));
+	box-shadow: inset 0 0 0 1px rgba(255, 208, 232, 0.6);
+}
+.chart-panel.playing .chart-viewport::-webkit-scrollbar-track {
+	background: linear-gradient(180deg, rgba(255, 102, 170, 0.14), rgba(0, 0, 0, 0.3));
 }
 .chart-stage {
 	position: relative;
 }
-.chart-stage canvas,
+.chart-notes,
 .chart-overlay {
 	display: block;
+	position: absolute;
+	inset: 0;
+	pointer-events: none;
+}
+.chart-notes {
+	z-index: 1;
 }
 .chart-overlay {
-	position: absolute;
-	top: 0;
-	left: 0;
-	pointer-events: none;
-	z-index: 1;
+	z-index: 2;
 }
 .chart-tooltip {
 	position: absolute;
 	pointer-events: none;
-	z-index: 2;
+	z-index: 3;
 	background: rgba(20, 14, 20, 0.95);
 	border: 1px solid var(--accent-dim);
 	border-radius: 8px;
@@ -450,9 +541,23 @@ body {
 	font-family: var(--mono);
 	font-size: 13px;
 }
+.timing-row {
+	cursor: pointer;
+	transition: border-color 0.12s ease, background 0.12s ease;
+}
+.timing-row:hover {
+	border-color: var(--accent-dim);
+}
+.timing-row.selected {
+	border-color: #ffcf6a;
+	background: rgba(255, 207, 106, 0.1);
+}
 .timing-row.ramp {
 	border-left: 2px solid var(--accent);
 	background: linear-gradient(90deg, rgba(255, 102, 170, 0.08), var(--bg-raise));
+}
+.timing-row.ramp.selected {
+	border-left-color: #ffcf6a;
 }
 .timing-row.ramp .timing-bpm {
 	display: flex;

@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { ManiaSet } from "./model";
 
 // --- Realm shapes (subset of fields we use) ---
 
@@ -15,6 +16,7 @@ export interface RealmMetadata {
 	Author?: { Username?: string };
 	Source?: string;
 	Tags?: string;
+	AudioFile?: string;
 }
 
 export interface RealmDifficulty {
@@ -40,9 +42,15 @@ export interface RealmBeatmap {
 	TotalObjectCount: number;
 }
 
+export interface RealmNamedFile {
+	Filename: string;
+	File?: Ref;
+}
+
 export interface RealmBeatmapSet {
 	ID: string;
 	Beatmaps: Ref[];
+	Files?: RealmNamedFile[];
 }
 
 export interface RealmDump {
@@ -69,6 +77,11 @@ export interface TimingInfo {
 	meter: number;
 }
 
+export interface SvPoint {
+	time: number;
+	sv: number;
+}
+
 export interface ManiaNote {
 	start_time: number;
 	column: number;
@@ -87,6 +100,7 @@ export interface BeatmapDetail {
 	difficulty: DifficultySettings;
 	bpm: BpmSummary;
 	timing_points: TimingInfo[];
+	sv_points: SvPoint[];
 	notes: ManiaNote[];
 	star_rating: number;
 	length_ms: number;
@@ -100,6 +114,20 @@ export async function loadRealm(path: string): Promise<RealmDump> {
 	return JSON.parse(json) as RealmDump;
 }
 
+/**
+ * Load the mania library grouped in Rust (parse + filter + grouping happen in
+ * the backend, so the frontend never parses the full realm dump). Returns the
+ * ready-to-render sidebar model.
+ */
+export function loadManiaLibrary(path: string): Promise<ManiaSet[]> {
+	return invoke<ManiaSet[]>("read_mania_library", { path });
+}
+
 export function loadBeatmap(hash: string): Promise<BeatmapDetail> {
 	return invoke<BeatmapDetail>("read_beatmap", { hash });
+}
+
+/** Read a content-addressed file's raw bytes (e.g. a beatmap's audio) by hash. */
+export function loadAudio(hash: string): Promise<ArrayBuffer> {
+	return invoke<ArrayBuffer>("read_audio", { hash });
 }
