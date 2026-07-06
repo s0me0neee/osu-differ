@@ -10,11 +10,37 @@ fn osu_files_dir() -> PathBuf {
     let base = dirs::data_dir().expect("no data dir");
     #[cfg(windows)]
     {
-        base.join("../osu/files")
+        let p = base.join("../osu/files");
+        info!("using osu file path: {}", p.display());
+        p
     }
     #[cfg(not(windows))]
     {
-        base.join("osu").join("files")
+        use log::info;
+
+        let p = base.join("osu").join("files");
+        info!("using osu file path: {}", p.display());
+        p
+    }
+}
+
+pub(crate) fn osu_logs_dir() -> PathBuf {
+    let data_dir = dirs::data_dir().expect("no data dir");
+
+    #[cfg(windows)]
+    {
+        use dirs::data_dir;
+
+        let p = data_dir().join("../osu/logs");
+        info!("using osu file path: {}", p.display());
+        p
+    }
+    #[cfg(not(windows))]
+    {
+        use log::info;
+        let p = data_dir.join("osu").join("logs");
+        info!("using osu file path: {}", p.display());
+        p
     }
 }
 
@@ -44,6 +70,14 @@ pub struct TimingInfo {
     pub meter: i32,
 }
 
+/// A mania scroll-speed (green line / effect) point. `sv` is the scroll-speed
+/// multiplier active from `time` onward (default 1.0).
+#[derive(Serialize)]
+pub struct SvPoint {
+    pub time: f64,
+    pub sv: f64,
+}
+
 /// A mania note. `end_time` is set for long notes (holds), `None` for taps.
 #[derive(Serialize)]
 pub struct ManiaNote {
@@ -66,6 +100,8 @@ pub struct BeatmapDetail {
     pub difficulty: DifficultySettings,
     pub bpm: BpmSummary,
     pub timing_points: Vec<TimingInfo>,
+    /// mania scroll-speed multipliers over time (from green lines / effect points)
+    pub sv_points: Vec<SvPoint>,
     pub notes: Vec<ManiaNote>,
     pub star_rating: f64,
     /// span from first note start to last note end, in ms
@@ -124,6 +160,17 @@ pub fn read_beatmap_detail(hash: &str) -> Result<BeatmapDetail> {
         })
         .collect::<Vec<_>>();
 
+    // mania scroll-speed multipliers from green lines (effect points)
+    let sv_points = map
+        .control_points
+        .effect_points
+        .iter()
+        .map(|ep| SvPoint {
+            time: ep.time,
+            sv: ep.scroll_speed,
+        })
+        .collect::<Vec<_>>();
+
     let bpm = bpm_summary(&timing_points, &map.hit_objects);
 
     let attrs = rosu_pp::Beatmap::from_path(&path)
@@ -167,6 +214,7 @@ pub fn read_beatmap_detail(hash: &str) -> Result<BeatmapDetail> {
         },
         bpm,
         timing_points,
+        sv_points,
         star_rating: attrs,
         length_ms,
         tap_count,
@@ -221,6 +269,15 @@ fn bpm_summary(
 #[tauri::command]
 pub async fn read_beatmap(hash: String) -> Result<BeatmapDetail, String> {
     read_beatmap_detail(&hash).map_err(|e| e.to_string())
+}
+
+/// Read a content-addressed file (e.g. the beatmap's audio) by hash and return
+/// its raw bytes. The JS side receives an ArrayBuffer.
+#[tauri::command]
+pub async fn read_audio(hash: String) -> Result<tauri::ipc::Response, String> {
+    std::fs::read(osu_file_path(&hash))
+        .map(tauri::ipc::Response::new)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

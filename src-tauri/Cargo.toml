@@ -1,7 +1,7 @@
 [package]
 name = "osu_diff"
 version = "0.1.0"
-description = "A Tauri App"
+description = "osu!diff — mania beatmap analyzer"
 authors = ["you"]
 edition = "2021"
 
@@ -17,6 +17,11 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2.6.3", features = [] }
 
+[dev-dependencies]
+# Only for `bench_detection_latency`, which compares the raw poll tail against
+# filesystem notifications. Not linked into the app.
+notify = "8.0.0"
+
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2.5.4"
@@ -29,4 +34,4 @@ anyhow = "1.0.103"
 rosu-map = "0.2.1"
 rosu-pp = "4.0.1"
 dirs = "6.0.0"
-
+env_logger = "0.11.11"

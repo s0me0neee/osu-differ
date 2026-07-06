@@ -2,6 +2,13 @@ import type { ManiaDiff, ManiaSet } from "./model";
 
 type SelectHandler = (diff: ManiaDiff) => void;
 
+export interface SidebarHandle {
+	/** Programmatically open + select a difficulty by its beatmap hash (expands
+	 * its set, highlights it, scrolls to it, and fires onSelect). Returns whether
+	 * a matching row was found. */
+	selectByHash(hash: string): boolean;
+}
+
 const KEY_HUES: Record<number, string> = {
 	4: "#7cc6ff",
 	5: "#8affc1",
@@ -22,7 +29,7 @@ export function renderSidebar(
 	root: HTMLElement,
 	sets: ManiaSet[],
 	onSelect: SelectHandler,
-): void {
+): SidebarHandle {
 	root.textContent = "";
 
 	const search = document.createElement("input");
@@ -84,6 +91,7 @@ export function renderSidebar(
 			stars.textContent = `★ ${diff.stars.toFixed(2)}`;
 			row.appendChild(stars);
 
+			row.dataset.hash = diff.hash; // for selectByHash lookups
 			row.addEventListener("click", () => selectDiff(row, diff));
 			diffs.appendChild(row);
 		}
@@ -115,4 +123,28 @@ export function renderSidebar(
 
 	search.addEventListener("input", () => render(search.value));
 	render("");
+
+	const selectByHash = (hash: string): boolean => {
+		// Clear any active filter so the target set is present in the DOM.
+		if (search.value) {
+			search.value = "";
+			render("");
+		}
+		const row = list.querySelector<HTMLElement>(
+			`.diff-row[data-hash="${CSS.escape(hash)}"]`,
+		);
+		if (!row) return false;
+		// Expand the containing set so the selection is visible.
+		const wrap = row.closest(".set");
+		const diffs = wrap?.querySelector<HTMLElement>(".diff-list");
+		if (diffs?.hidden) {
+			diffs.hidden = false;
+			wrap?.classList.add("open");
+		}
+		row.click(); // reuses selectDiff: highlight + onSelect
+		row.scrollIntoView({ block: "center" });
+		return true;
+	};
+
+	return { selectByHash };
 }
