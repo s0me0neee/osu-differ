@@ -9,6 +9,14 @@ fn node_path() -> &'static PathBuf {
     NODE.get_or_init(|| which::which_global("node").expect("Failed to find node"))
 }
 
+#[tauri::command]
+pub fn get_realm_path() -> String {
+    let p = std::path::absolute(crate::beatmap::osu_root_dir().join("client.realm.copy"))
+        .expect("Failed to get abs path of osu");
+    info!("using osu realm path: {}", p.display());
+    p.to_string_lossy().to_string()
+}
+
 // fn logger() -> &'static
 
 fn project_root() -> PathBuf {
@@ -140,6 +148,9 @@ pub struct ManiaDiffDto {
     name: String,
     stars: f64,
     key_count: u32,
+    /// true if this is an auto-converted (not mapper-authored mania) diff.
+    /// `key_count`/`stars` here are the original std beatmap's, not converted.
+    is_convert: bool,
     audio_hash: Option<String>,
     audio_file: Option<String>,
     meta: DiffMeta,
@@ -179,25 +190,36 @@ pub fn mania_library(dump_json: &str) -> Result<Vec<ManiaSetDto>> {
             let Some(b) = by_id.get(r.pk.as_str()) else {
                 continue;
             };
-            if b.ruleset.as_ref().map(|x| x.pk.as_str()) != Some("mania") {
-                continue;
-            }
+            // osu!lazer auto-converts osu!standard beatmaps into mania at
+            // play time; taiko/catch have no such mania conversion.
+            let is_convert = match b.ruleset.as_ref().map(|x| x.pk.as_str()) {
+                Some("mania") => false,
+                Some("osu") => true,
+                _ => continue,
+            };
             let meta = b.metadata.as_ref();
             let audio_file = meta.and_then(|m| m.audio_file.clone());
             let audio_hash = audio_file
                 .as_ref()
                 .and_then(|a| file_hash.get(&a.to_lowercase()).map(|s| s.to_string()));
-            let cs = b.difficulty.as_ref().and_then(|d| d.circle_size).unwrap_or(0.0);
+            let cs = b
+                .difficulty
+                .as_ref()
+                .and_then(|d| d.circle_size)
+                .unwrap_or(0.0);
             diffs.push(ManiaDiffDto {
                 hash: b.hash.clone().unwrap_or_default(),
                 name: b.difficulty_name.clone().unwrap_or_default(),
                 stars: b.star_rating.unwrap_or(0.0),
                 key_count: cs.round().max(0.0) as u32,
+                is_convert,
                 audio_hash,
                 audio_file,
                 meta: DiffMeta {
                     title: meta.and_then(|m| m.title.clone()).unwrap_or_default(),
-                    title_unicode: meta.and_then(|m| m.title_unicode.clone()).unwrap_or_default(),
+                    title_unicode: meta
+                        .and_then(|m| m.title_unicode.clone())
+                        .unwrap_or_default(),
                     artist: meta.and_then(|m| m.artist.clone()).unwrap_or_default(),
                     author: meta
                         .and_then(|m| m.author.as_ref())
@@ -232,11 +254,46 @@ pub fn mania_library(dump_json: &str) -> Result<Vec<ManiaSetDto>> {
 
     // sort by the romanized title so latin ordering is intuitive
     sets.sort_by(|a, b| {
-        let ka = if a.title_romanized.is_empty() { &a.title } else { &a.title_romanized };
-        let kb = if b.title_romanized.is_empty() { &b.title } else { &b.title_romanized };
+        let ka = if a.title_romanized.is_empty() {
+            &a.title
+        } else {
+            &a.title_romanized
+        };
+        let kb = if b.title_romanized.is_empty() {
+            &b.title
+        } else {
+            &b.title_romanized
+        };
         ka.to_lowercase().cmp(&kb.to_lowercase())
     });
     Ok(sets)
+}
+
+/// Resolve the hash of some real mania difficulty in the local library, so
+/// tests can exercise `read_beatmap_detail` against whatever's actually
+/// installed rather than one machine's hardcoded beatmap hash.
+#[cfg(test)]
+pub(crate) fn first_mania_hash(dump_json: &str) -> Result<String> {
+    let sets = mania_library(dump_json)?;
+    sets.into_iter()
+        .flat_map(|s| s.difficulties)
+        .filter(|d| !d.is_convert)
+        .map(|d| d.hash)
+        .find(|h| !h.is_empty())
+        .context("no mania difficulty with a hash found in the local library")
+}
+
+/// Same as [`first_mania_hash`] but for a convert-eligible (osu!standard)
+/// difficulty, so convert support can be tested without a hardcoded hash.
+#[cfg(test)]
+pub(crate) fn first_convert_hash(dump_json: &str) -> Result<String> {
+    let sets = mania_library(dump_json)?;
+    sets.into_iter()
+        .flat_map(|s| s.difficulties)
+        .filter(|d| d.is_convert)
+        .map(|d| d.hash)
+        .find(|h| !h.is_empty())
+        .context("no convert-eligible beatmap found in the local library")
 }
 
 #[tauri::command]
@@ -251,7 +308,7 @@ mod tests {
 
     #[test]
     fn reads_osu_realm() {
-        let path = "/Users/maot27/Library/Application Support/osu/client.realm.copy";
+        let path = &get_realm_path();
         let json = fetch_realm(path).expect("fetch_realm failed");
         let data: serde_json::Value = serde_json::from_str(&json).expect("invalid json");
         let obj = data.as_object().expect("expected top-level object");
@@ -261,7 +318,7 @@ mod tests {
 
     #[test]
     fn builds_mania_library() {
-        let path = "/Users/maot27/Library/Application Support/osu/client.realm.copy";
+        let path = &get_realm_path();
         let json = fetch_realm(path).expect("fetch_realm failed");
         let sets = mania_library(&json).expect("mania_library failed");
         println!(

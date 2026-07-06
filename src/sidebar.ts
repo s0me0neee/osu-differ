@@ -17,11 +17,20 @@ const KEY_HUES: Record<number, string> = {
 	8: "#c79bff",
 };
 
-function keyBadge(keys: number): HTMLElement {
+// isConvert: original std CS isn't the real mania key count (that requires
+// parsing the full .osu file), so avoid showing a misleading number here —
+// the info page computes and shows the real one.
+function keyBadge(keys: number, isConvert: boolean): HTMLElement {
 	const el = document.createElement("span");
 	el.className = "key-badge";
-	el.textContent = `${keys}K`;
-	el.style.color = KEY_HUES[keys] ?? "#cbb";
+	if (isConvert) {
+		el.textContent = "CV";
+		el.title = "auto-converted from osu!standard — key count shown on the info page";
+		el.style.color = "#999";
+	} else {
+		el.textContent = `${keys}K`;
+		el.style.color = KEY_HUES[keys] ?? "#cbb";
+	}
 	return el;
 }
 
@@ -79,7 +88,7 @@ export function renderSidebar(
 		for (const diff of set.difficulties) {
 			const row = document.createElement("button");
 			row.className = "diff-row";
-			row.appendChild(keyBadge(diff.keyCount));
+			row.appendChild(keyBadge(diff.keyCount, diff.isConvert));
 
 			const name = document.createElement("span");
 			name.className = "diff-name";

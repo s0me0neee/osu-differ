@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## Commands
+
+Don't write long comments, is the code is too hard to understand keep comments short and helpful
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this is
@@ -91,8 +95,11 @@ diff calls `loadBeatmap` → `renderDetail`.
 
 ## Gotchas
 
-- **Hardcoded user paths**: the realm path in `src/main.ts` and the test paths in
-  `realm.rs` / `beatmap.rs` point at a specific machine's osu! install. Tests will
-  fail on other machines until these are parametrized.
+- **Realm path is resolved, not hardcoded**: `src/main.ts` and the `realm.rs` /
+  `beatmap.rs` tests all call the `get_realm_path` command / `osu_root_dir()`
+  helper (`beatmap.rs`) instead of a fixed path, so they work on any machine with
+  a local osu! install — `beatmap.rs`'s test additionally resolves its beatmap
+  hash via `realm::first_mania_hash` rather than a fixed content hash, so it only
+  requires *some* mania difficulty to be present, not one specific map.
 - `asset/*.realm*` and `src-tauri/binaries/` are git-ignored (personal data / a
   large abandoned sidecar binary); the app shells out to system `node` instead.

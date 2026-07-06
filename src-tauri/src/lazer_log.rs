@@ -11,12 +11,12 @@
 //!
 //! The log's embedded timestamps are **whole-second resolution** (`HH:MM:SS`, no
 //! fraction), so we never use them as the start instant. Instead, for timing-
-//! critical lines we capture a monotonic [`Instant`] the moment we *read* the
-//! line — the highest-resolution start estimate the log can support and the
-//! anchor a later hit-matching phase shares a clock domain with. To keep that
-//! observation instant as close to the true event as possible we poll the file
-//! on a tight interval rather than relying on FSEvents (which coalesces/defers
-//! notifications and would add tens of ms of slop).
+//! critical lines we capture a wall-clock [`SystemTime`] the moment we *read*
+//! the line. Wall-clock, not [`Instant`], because this value crosses into the
+//! frontend's process (a different clock domain) — see `StartSignal`. To keep
+//! the observation instant as close to the true event as possible we poll the
+//! file on a tight interval rather than relying on FSEvents (which coalesces/
+//! defers notifications and would add tens of ms of slop).
 //!
 //! The residual, uncontrollable error is osu's own log-flush latency: the gap
 //! between `StartGameplayClock` firing and the line being flushed to disk. That
@@ -29,7 +29,7 @@ use log::{info, warn};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// A parsed line of interest from `runtime.log`. Everything we don't recognise
 /// collapses to `Unrecognized` — the log is overwhelmingly noise we don't need.
@@ -46,10 +46,16 @@ pub enum LazerEvent {
     /// Gameplay clock seeked to a lead-in offset in ms (usually negative — the
     /// pre-roll before the audio's zero point).
     LeadIn(i64),
-    /// Gameplay clock started — playback begins ~now. Our "start time" signal.
+    /// Gameplay clock started — playback begins ~now. Fires on the initial
+    /// start AND on every resume after a pause.
     GameplayStarted,
-    /// Gameplay clock stopped (finished or quit).
+    /// Gameplay clock stopped. Fires on a pause exactly like it does on the
+    /// final stop — only `ExitedSoloPlayer` tells them apart.
     GameplayStopped,
+    /// The play screen was entered — a new play session is beginning.
+    EnteredSoloPlayer,
+    /// The play screen was exited — the play session is definitely over.
+    ExitedSoloPlayer,
     Unrecognized,
 }
 
@@ -88,7 +94,10 @@ fn parse_beatmap_string(s: &str) -> Option<(String, String, String, String)> {
     // creator: trailing "(...)"
     let (head, creator) = if head.ends_with(')') {
         match head.rfind(" (") {
-            Some(open) => (head[..open].trim_end(), head[open + 2..head.len() - 1].to_string()),
+            Some(open) => (
+                head[..open].trim_end(),
+                head[open + 2..head.len() - 1].to_string(),
+            ),
             None => (head, String::new()),
         }
     } else {
@@ -128,6 +137,20 @@ pub fn parse_line(line: &str) -> LazerEvent {
     }
     if msg.starts_with("GameplayClockContainer stopped") {
         return LazerEvent::GameplayStopped;
+    }
+    // screen-stack lines: "📺 OsuScreenStack#N(depth:D) entered SoloPlayer#M"
+    // (must be "SoloPlayer#", not "SoloPlayer+PlayerLoader#" — that's the
+    // loading screen before gameplay actually starts).
+    if let Some(rest) = msg.strip_prefix("📺 ") {
+        if let Some(idx) = rest.find(" entered ") {
+            if rest[idx + " entered ".len()..].starts_with("SoloPlayer#") {
+                return LazerEvent::EnteredSoloPlayer;
+            }
+        } else if let Some(idx) = rest.find(" exit from ") {
+            if rest[idx + " exit from ".len()..].starts_with("SoloPlayer#") {
+                return LazerEvent::ExitedSoloPlayer;
+            }
+        }
     }
     LazerEvent::Unrecognized
 }
@@ -221,33 +244,66 @@ fn read_new_lines(
     Ok(drain_lines(partial))
 }
 
-/// Emitted when gameplay starts. `started_at` is the monotonic instant we
-/// observed the start line; audio position 0 is reached `|lead_in_ms|` ms after
-/// that (the gameplay clock begins at `-lead_in` and counts up). Together with
-/// the beatmap identity this is everything the app needs to play the same song
-/// aligned to the live session.
+/// Emitted on every gameplay start — the session's first start AND every
+/// resume after a pause. `audio_zero` is the wall-clock instant song position
+/// 0 occurs, already resume-adjusted; the frontend/lib.rs use it as-is, no
+/// further lead-in math needed. `lead_in_ms` is `Some` only for the very
+/// first start of a session (there's no lead-in count-in on a resume).
 #[derive(Debug, Clone)]
 pub struct StartSignal {
     pub artist: String,
     pub title: String,
     pub difficulty: String,
-    pub started_at: Instant,
+    pub audio_zero: SystemTime,
     pub lead_in_ms: Option<i64>,
 }
 
-/// What the follower hands to its sink. `Stop` mirrors gameplay ending.
+/// Emitted when the game-wide working beatmap changes (song select / preview /
+/// the map about to be played). Identity only — no timing. The frontend uses it
+/// to jump to whatever the player currently has picked.
+#[derive(Debug, Clone)]
+pub struct SelectSignal {
+    pub artist: String,
+    pub title: String,
+    pub difficulty: String,
+}
+
+/// What the follower hands to its sink. `Select` fires on every song pick;
+/// `Start`/`Stop` mirror gameplay beginning and ending.
+#[derive(Debug)]
 pub enum LiveSignal {
+    Select(SelectSignal),
     Start(StartSignal),
     Stop,
 }
 
-/// Holds cross-line state (last working beatmap, pending lead-in) and turns the
-/// event stream into log lines plus `LiveSignal`s. Public + separately testable
-/// so it doesn't need a live tail to exercise.
+/// One "SoloPlayer" gameplay session, from entering the play screen to
+/// exiting it. Multiple Start/Stop pairs can happen within one session
+/// (pause/resume) — only the session's first Start uses the lead-in; later
+/// ones resume from wherever the clock was frozen at the last Stop.
+struct PlaySession {
+    artist: String,
+    title: String,
+    difficulty: String,
+    /// wall-clock instant at which song position 0 occurs, recomputed on
+    /// every Start (lead-in based the first time, resume-based after).
+    audio_zero: SystemTime,
+    /// song position (ms) frozen at the last Stop. Negative means still in
+    /// the lead-in (position 0 hadn't been reached yet). `None` until the
+    /// session has been paused at least once.
+    paused_position_ms: Option<f64>,
+}
+
+/// Holds cross-line state (last working beatmap, pending lead-in, the current
+/// play session) and turns the event stream into log lines plus
+/// `LiveSignal`s. Public + separately testable so it doesn't need a live tail
+/// to exercise. Only one `PlaySession` exists at a time, so there's never any
+/// ambiguity about which play is currently live.
 #[derive(Default)]
 pub struct Follower {
     current: Option<(String, String, String, String)>, // artist, title, creator, difficulty
-    lead_in_ms: Option<i64>,
+    lead_in_ms: Option<i64>, // pending lead-in for the next session's first start
+    session: Option<PlaySession>,
 }
 
 impl Follower {
@@ -255,15 +311,14 @@ impl Follower {
         Self::default()
     }
 
-    /// Feed one event. `ts` is the line's (±1s) embedded timestamp, kept only for
-    /// human display; `observed` is a monotonic clock sampled the instant the
-    /// line was read — the actual timing reference for start events. Returns a
-    /// `LiveSignal` when gameplay starts or stops.
+    /// Feed one event. `ts` is the line's (±1s) embedded timestamp, kept only
+    /// for display; `wall_now` is a wall-clock sample taken when the line was
+    /// read. Returns a `LiveSignal` when gameplay starts or stops.
     pub fn handle(
         &mut self,
         event: LazerEvent,
         ts: Option<&str>,
-        observed: Instant,
+        wall_now: SystemTime,
     ) -> Option<LiveSignal> {
         let at = ts.unwrap_or("(unknown time)");
         match event {
@@ -273,43 +328,102 @@ impl Follower {
                 creator,
                 difficulty,
             } => {
+                // osu! can log a repeat "working beatmap" line for the map
+                // that's already selected (e.g. re-entering song select); skip
+                // the clone + emit + frontend rebuild when nothing changed.
+                let unchanged = self
+                    .current
+                    .as_ref()
+                    .is_some_and(|(a, t, c, d)| *a == artist && *t == title && *c == creator && *d == difficulty);
+                if unchanged {
+                    return None;
+                }
                 info!("♪ Selected: {artist} - {title} [{difficulty}] (mapper: {creator})");
+                let signal = LiveSignal::Select(SelectSignal {
+                    artist: artist.clone(),
+                    title: title.clone(),
+                    difficulty: difficulty.clone(),
+                });
                 self.current = Some((artist, title, creator, difficulty));
-                None
+                Some(signal)
             }
             LazerEvent::LeadIn(ms) => {
                 self.lead_in_ms = Some(ms);
                 None
             }
+            LazerEvent::EnteredSoloPlayer => {
+                // a new play is beginning; drop anything left over from a
+                // prior session that didn't clean up (e.g. a crash).
+                self.session = None;
+                None
+            }
             LazerEvent::GameplayStarted => {
-                let lead_in_ms = self.lead_in_ms;
-                let (song, signal) = match &self.current {
-                    Some((artist, title, _, difficulty)) => (
-                        format!("{artist} - {title} [{difficulty}]"),
-                        Some(LiveSignal::Start(StartSignal {
-                            artist: artist.clone(),
-                            title: title.clone(),
-                            difficulty: difficulty.clone(),
-                            started_at: observed,
-                            lead_in_ms,
-                        })),
-                    ),
-                    None => ("(unknown beatmap)".to_string(), None),
+                let Some((artist, title, _, difficulty)) = self.current.clone() else {
+                    return None; // no known beatmap to attach a session to
                 };
+                let paused_ms = self.session.as_ref().and_then(|s| s.paused_position_ms);
+                let (audio_zero, lead_in_ms) = match paused_ms {
+                    Some(ms) if ms >= 0.0 => {
+                        // resume: shift audio-zero back so the frozen position lands at "now"
+                        (
+                            wall_now
+                                .checked_sub(Duration::from_millis(ms as u64))
+                                .unwrap_or(wall_now),
+                            None,
+                        )
+                    }
+                    Some(ms) => {
+                        // paused during the lead-in (position still negative): the
+                        // remaining count-in still applies on resume
+                        (wall_now + Duration::from_millis((-ms) as u64), None)
+                    }
+                    None => {
+                        // first start of a new session
+                        let lead = self.lead_in_ms.take();
+                        (
+                            wall_now + Duration::from_millis(lead.unwrap_or(0).unsigned_abs()),
+                            lead,
+                        )
+                    }
+                };
+                self.session = Some(PlaySession {
+                    artist: artist.clone(),
+                    title: title.clone(),
+                    difficulty: difficulty.clone(),
+                    audio_zero,
+                    paused_position_ms: None,
+                });
+                let kind = if paused_ms.is_some() { "Resumed" } else { "Playing" };
                 let lead = match lead_in_ms {
-                    // audio onset is |lead_in| ms after the clock starts.
                     Some(ms) => format!("lead-in {ms} ms → audio onset +{} ms", ms.unsigned_abs()),
-                    None => "lead-in unknown".into(),
+                    None => "resuming from pause".into(),
                 };
-                info!("▶ Playing: {song} — clock start ~{at} (±1s); {lead}");
-                signal
+                info!("▶ {kind}: {artist} - {title} [{difficulty}] — clock start ~{at} (±1s); {lead}");
+                Some(LiveSignal::Start(StartSignal {
+                    artist,
+                    title,
+                    difficulty,
+                    audio_zero,
+                    lead_in_ms,
+                }))
             }
             LazerEvent::GameplayStopped => {
-                if let Some((artist, title, _, difficulty)) = &self.current {
-                    info!("⏹ Stopped: {artist} - {title} [{difficulty}] at {at}");
+                if let Some(session) = &mut self.session {
+                    let position_ms = match wall_now.duration_since(session.audio_zero) {
+                        Ok(d) => d.as_secs_f64() * 1000.0,
+                        Err(e) => -(e.duration().as_secs_f64() * 1000.0),
+                    };
+                    session.paused_position_ms = Some(position_ms);
+                    info!(
+                        "⏹ Clock stopped: {} - {} [{}] at {at} (pause or end — position {position_ms:.0}ms)",
+                        session.artist, session.title, session.difficulty
+                    );
                 }
-                self.lead_in_ms = None;
                 Some(LiveSignal::Stop)
+            }
+            LazerEvent::ExitedSoloPlayer => {
+                self.session = None;
+                None
             }
             LazerEvent::Unrecognized => None,
         }
@@ -371,14 +485,12 @@ pub fn follow_forever(dir: &Path, mut on_signal: impl FnMut(LiveSignal)) -> ! {
 
         if let Some(t) = &mut tail {
             match t.poll() {
-                // Stamp the observation instant the moment the read returns new
-                // bytes, before any parsing/printing — so the start anchor isn't
-                // pushed later by our own filter/log work.
+                // Stamp before parsing, so our own work doesn't push it later.
                 Ok(lines) if !lines.is_empty() => {
-                    let observed = Instant::now();
+                    let wall_now = SystemTime::now();
                     for line in lines {
                         if let Some(sig) =
-                            follower.handle(parse_line(&line), split_line(&line).0, observed)
+                            follower.handle(parse_line(&line), split_line(&line).0, wall_now)
                         {
                             on_signal(sig);
                         }
@@ -452,8 +564,84 @@ mod tests {
     }
 
     #[test]
+    fn parses_solo_player_screen_transitions() {
+        assert_eq!(
+            parse_line("2026-07-06 19:31:18 [verbose]: 📺 OsuScreenStack#408(depth:6) entered SoloPlayer#497"),
+            LazerEvent::EnteredSoloPlayer
+        );
+        assert_eq!(
+            parse_line("2026-07-06 19:32:19 [verbose]: 📺 OsuScreenStack#408(depth:5) exit from SoloPlayer#497"),
+            LazerEvent::ExitedSoloPlayer
+        );
+        // the loading screen before gameplay actually starts — must not be
+        // mistaken for the real SoloPlayer screen.
+        assert_eq!(
+            parse_line("2026-07-06 19:51:59 [verbose]: 📺 OsuScreenStack#408(depth:5) entered SoloSongSelect+PlayerLoader#633"),
+            LazerEvent::Unrecognized
+        );
+    }
+
+    #[test]
+    fn tracks_pause_and_resume_within_one_session() {
+        let mut f = Follower::new();
+        let t0 = SystemTime::now();
+
+        f.handle(
+            LazerEvent::WorkingBeatmap {
+                artist: "A".into(),
+                title: "T".into(),
+                creator: "C".into(),
+                difficulty: "D".into(),
+            },
+            None,
+            t0,
+        );
+        f.handle(LazerEvent::EnteredSoloPlayer, None, t0);
+        f.handle(LazerEvent::LeadIn(-1000), None, t0);
+
+        let start1 = match f.handle(LazerEvent::GameplayStarted, None, t0) {
+            Some(LiveSignal::Start(s)) => s,
+            other => panic!("expected Start, got {other:?}"),
+        };
+        assert_eq!(start1.lead_in_ms, Some(-1000));
+        assert_eq!(start1.audio_zero.duration_since(t0).unwrap().as_millis(), 1000);
+
+        // 3s into the song (1s lead-in + 3s played), pause for 10 real seconds
+        let t_pause = t0 + Duration::from_millis(4000);
+        assert!(matches!(
+            f.handle(LazerEvent::GameplayStopped, None, t_pause),
+            Some(LiveSignal::Stop)
+        ));
+        let t_resume = t_pause + Duration::from_secs(10);
+        let start2 = match f.handle(LazerEvent::GameplayStarted, None, t_resume) {
+            Some(LiveSignal::Start(s)) => s,
+            other => panic!("expected Start, got {other:?}"),
+        };
+        assert_eq!(start2.lead_in_ms, None, "a resume has no lead-in count-in");
+        // resumes 3000ms into the song, so audio_zero shifts to t0+11000ms
+        assert_eq!(start2.audio_zero.duration_since(t0).unwrap().as_millis(), 11000);
+
+        // end this play entirely
+        let t_end = t_resume + Duration::from_secs(5);
+        f.handle(LazerEvent::GameplayStopped, None, t_end);
+        f.handle(LazerEvent::ExitedSoloPlayer, None, t_end);
+
+        // a brand new session must not inherit the old paused position
+        let t2 = t_end + Duration::from_secs(20);
+        f.handle(LazerEvent::EnteredSoloPlayer, None, t2);
+        let start3 = match f.handle(LazerEvent::GameplayStarted, None, t2) {
+            Some(LiveSignal::Start(s)) => s,
+            other => panic!("expected Start, got {other:?}"),
+        };
+        assert_eq!(start3.audio_zero, t2, "fresh session, no lead-in, no stale pause state");
+    }
+
+    #[test]
     fn ignores_noise_and_header() {
-        assert_eq!(parse_line("runtime Log (LogLevel: Verbose)"), LazerEvent::Unrecognized);
+        assert_eq!(
+            parse_line("runtime Log (LogLevel: Verbose)"),
+            LazerEvent::Unrecognized
+        );
         assert_eq!(
             parse_line("2026-07-06 07:37:36 [verbose]: Loaded RealmDetachedBeatmapStore!"),
             LazerEvent::Unrecognized
@@ -481,7 +669,10 @@ mod tests {
 
         // append a full line plus a partial (no trailing newline yet)
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(b"second\nthi").unwrap();
         }
         let l = read_new_lines(&path, &mut offset, &mut partial).unwrap();
@@ -489,7 +680,10 @@ mod tests {
 
         // finish the partial line
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(b"rd\n").unwrap();
         }
         let l = read_new_lines(&path, &mut offset, &mut partial).unwrap();
@@ -510,7 +704,10 @@ mod tests {
         assert!(tail.poll().unwrap().is_empty());
 
         {
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             f.write_all(b"new line\n").unwrap();
         }
         assert_eq!(tail.poll().unwrap(), vec!["new line".to_string()]);
@@ -614,7 +811,9 @@ mod tests {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     match ev_rx.recv_timeout(remaining) {
                         Ok(_) => {
-                            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(last_len);
+                            let len = std::fs::metadata(&path)
+                                .map(|m| m.len())
+                                .unwrap_or(last_len);
                             if len > last_len {
                                 last_len = len;
                                 lat.push(
@@ -631,7 +830,10 @@ mod tests {
                 }
             }
             writer.join().unwrap();
-            println!("notify crate  : {}   [missed/timed-out: {drops}]", stats(lat));
+            println!(
+                "notify crate  : {}   [missed/timed-out: {drops}]",
+                stats(lat)
+            );
         }
 
         std::fs::remove_dir_all(&dir).ok();

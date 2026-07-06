@@ -2,19 +2,50 @@
 
 Companion to `timing_overlay_design_summary.md`. Each task below is scoped to be handed to Claude Code as a self-contained unit: clear inputs, outputs, files touched, and a concrete "done when" check. Do them in order — later phases depend on earlier ones compiling and passing their own checks first. Each task also lists explicit non-goals, to stop an agentic session from quietly expanding scope into the next phase.
 
+## Progress status (updated 2026-07-06)
+
+Where each phase actually stands in the current tree:
+
+- **Phase 0 — Partial.** No audio/correlation deps added yet (`cpal`/`symphonia`/`rubato`
+  are absent). `notify` is present but only as a **dev-dependency** for the
+  `bench_detection_latency` benchmark, not for the watcher. `osu_logs_dir()` exists.
+- **Phase 1 (log tail + parser) — DONE**, in a single flat `src-tauri/src/lazer_log.rs`
+  with passing unit tests. Architecture differs from the sketch below (poll, not
+  `notify`; sync thread + callback, not tokio mpsc; different `LazerEvent` variants) —
+  see the corrected notes in Phase 0/1.
+- **Phase 7.1 (Rust→frontend event bridge) — DONE, out of order.** The app emits three
+  events from `lib.rs` and listens in `src/livesync.ts`:
+  `live-select` (working beatmap changed → app jumps to that difficulty),
+  `live-play` (gameplay start → jump there and start the note chart's own audio+scroll
+  playback in sync with osu!), and `live-stop` (halts it). No judged-hit events yet.
+- **Phases 2, 3, 4, 5, 6, 7.2, 8 — not started.**
+
+Current strategy note: instead of jumping to audio capture + correlation (Phases 3–4),
+the app first shipped a **log-only live-sync latency test** — on gameplay start it computes
+`start_in_ms` from the log's lead-in plus the monotonic observation instant and plays the
+same song in the frontend, so we can *measure by ear/eye* how much error the log-only path
+actually has. `lib.rs` calls this "a manual latency check, not a shipped feature." This is
+effectively Phase 8.1's validation done early; if the log-only error budget turns out
+acceptable, the audio-correlation phases (3–4) may be reduced or dropped. Decide that
+before building the correlation engine.
+
 ## Reconciliation with the current app (read first)
 
 This plan predates the current codebase; the following is already true and should be
 **reused, not rebuilt**:
 
-- **Backend surface** is four Tauri commands in `src-tauri/src/lib.rs`:
-  `read_realm`, `read_mania_library`, `read_beatmap`, `read_audio` — each a thin
-  `#[tauri::command]` wrapper over a pure `anyhow::Result` function. The app is
-  **request/response `invoke` only** — there is currently **no `emit`/`listen`**
-  anywhere (Phase 7 introduces the first event bridge).
+- **Backend surface** is **five** Tauri commands in `src-tauri/src/lib.rs`:
+  `read_realm`, `read_mania_library`, `get_realm_path`, `read_beatmap`, `read_audio` —
+  each a thin `#[tauri::command]` wrapper over a pure `anyhow::Result` function.
+  ⚠️ The app is **no longer `invoke`-only**: an `emit`/`listen` bridge already exists
+  (`AppHandle::emit` for `live-play`/`live-stop` in `lib.rs`; `listen()` in
+  `src/livesync.ts`). Phase 7.1 is therefore already built — reuse it.
 - **Log dir already resolved**: `osu_logs_dir()` exists in `beatmap.rs`
   (`dirs::data_dir()/osu/logs` on macOS/Linux, `../osu/logs` on Windows). Append
-  `runtime.log`. No new path helper needed.
+  `runtime.log`. No new path helper needed. On **this** (Linux) machine it resolves to
+  `~/.local/share/osu/logs` — the earlier "~/Library/Application Support" note was macOS.
+  Note osu writes a *new* `<sessionId>.runtime.log` per launch, so the tail follows the
+  newest `*.runtime.log` and rotates when a fresher one appears (already handled).
 - **Library already indexed**: `realm::mania_library` groups mania difficulties into
   sets, each carrying `hash` (beatmap `.osu` content hash), difficulty `name`,
   `audio_hash`, `audio_file`, `stars`, `key_count`, and `DiffMeta { title,
@@ -38,69 +69,99 @@ This plan predates the current codebase; the following is already true and shoul
   gameplay it does not clock-control, which is exactly why the audio correlation in
   Phases 3–4 is needed.
 
-Suggested module layout — the existing backend uses **flat files** in `src-tauri/src/`
-(`beatmap.rs`, `realm.rs`, `lib.rs`), not nested `mod.rs` trees. Match that; add either
-flat files or shallow subdirs:
+Module layout — the backend uses **flat files** in `src-tauri/src/`, not nested `mod.rs`
+trees. Match that. Current + planned:
 
 ```
 src-tauri/
   src/
-    lib.rs            -- register the new commands alongside the existing four
-    lazer_log.rs      -- Phase 1  (watcher + parser; split if it grows)
-    library.rs        -- Phase 2  (thin resolver over realm::mania_library)
+    lib.rs            -- registers the five commands; owns the log-tail thread +
+                         `live-play`/`live-stop` emit (Phase 1 wiring + Phase 7.1 bridge)
+    lazer_log.rs      -- Phase 1 DONE: watcher + parser in ONE flat file (no split needed
+                         yet). Poll-based `Tail`, sync thread + `on_signal` callback.
+    library.rs        -- Phase 2  (thin resolver over realm::mania_library) — TODO
     audio.rs          -- Phase 3-4 (reference decode/downsample, cpal capture, correlate)
-    session.rs        -- Phase 5  (state machine)
-    judgment.rs       -- Phase 6  (hit matching)
+                         — TODO, and possibly de-scoped; see the strategy note above
+    session.rs        -- Phase 5  (state machine) — TODO
+    judgment.rs       -- Phase 6  (hit matching) — TODO
 ```
+
+Frontend: `src/livesync.ts` already owns the `live-play`/`live-stop` listener and the
+in-sync playback for the latency test — the overlay widget (Phase 7.2) should build
+alongside it, in the same hand-rolled `<canvas>` style as `src/detail.ts`.
 
 ---
 
-## Phase 0 — Scaffolding
+## Phase 0 — Scaffolding  *(status: partial)*
 
 **Goal:** dependencies compile; no logic yet.
 
-- Add to `Cargo.toml` the **new** deps only: `cpal`, `symphonia` (enable the codec
-  features for your beatmaps' audio — mp3/ogg/vorbis), `rubato`, `notify`. Already
-  present, do **not** re-add: `serde`, `serde_json`, `rosu-map`, `rosu-pp`, `dirs`,
-  `anyhow`, `which`, `log`, `tauri-plugin-log`.
-- The log path helper already exists: `osu_logs_dir()` in `beatmap.rs`. On this
-  machine it resolves to `~/Library/Application Support/osu/logs`; append
-  `runtime.log`. Make the filename a constant, optionally overridable via env var. No
-  new path function.
+- Deps still to add when Phases 3–4 begin: `cpal`, `symphonia` (enable the codec
+  features for your beatmaps' audio — mp3/ogg/vorbis), `rubato`. Already present, do
+  **not** re-add: `serde`, `serde_json`, `rosu-map`, `rosu-pp`, `dirs`, `anyhow`,
+  `which`, `log`, `tauri-plugin-log`.
+- ⚠️ **`notify` is NOT a runtime dep and should not become one.** Phase 1 evaluated it
+  and **rejected** it: `bench_detection_latency` (in `lazer_log.rs`) measured a 1ms
+  held-handle `read` poll noticing appends in ~0.2ms median, while `notify` (FSEvents)
+  coalesced writes so badly it missed 299/300. `notify` is kept only as a
+  **dev-dependency** for that benchmark. The live tail uses the poll.
+- The log path helper already exists: `osu_logs_dir()` in `beatmap.rs`. On this (Linux)
+  machine it resolves to `~/.local/share/osu/logs`. The follower already targets the
+  newest `*.runtime.log` (osu rotates per launch) — the filename is not a fixed constant.
 
 **Done when:** `cargo build` succeeds with all deps present, no warnings about unused-for-now crates needed.
 
-**Non-goals:** no watcher, no parsing, no audio yet.
+**Non-goals:** no audio yet. (Watcher + parsing are already done — see Phase 1.)
 
 ---
 
-## Phase 1 — Log tail (`lazer_log/`)
+## Phase 1 — Log tail (`lazer_log.rs`)  *(status: DONE)*
 
-### 1.1 Raw line watcher (`watcher.rs`)
+Built as a **single flat `lazer_log.rs`**, not a `watcher.rs`/`parser.rs` split — it's
+small enough that the split wasn't worth it. What actually shipped, and where it differs
+from the original sketch below:
 
-Byte-offset-tracked file tail using `notify`, starting at current EOF (ignore history on startup). Emits raw `String` lines via a channel. Note the app already pulls in **Tokio** transitively via Tauri 2 and uses `async` commands (`read_audio` is `async`), so `tokio::sync::mpsc` is the natural fit; keep the watcher on a spawned task rather than blocking a command.
+### 1.1 Raw line watcher — DONE (poll, not `notify`; sync thread, not tokio)
 
-**Done when:** running it against a live `tail -f`-style test (or a script that appends lines to a scratch file on a timer) delivers each appended line exactly once, in order, with no duplicates or drops across at least 50 appended lines.
+Implemented as a held-open `Tail` struct: one `read` syscall per 1ms `POLL` tick on a
+handle kept at EOF (starts at EOF, ignores history), draining `\n`-terminated lines and
+keeping any trailing fragment. Rotation to a fresher `*.runtime.log` is checked every
+`ROTATE_CHECK` (500ms). It runs on a plain `std::thread` and delivers results via an
+`FnMut(LiveSignal)` **callback** (`follow_forever` / `Follower::handle`) — **not** a
+`tokio::sync::mpsc` channel. The monotonic `Instant` is stamped the moment `poll` returns
+new bytes, before parsing, so the start anchor isn't pushed by our own work. Covered by
+`tail_reads_only_appends_from_eof` and `read_new_lines_tails_appends` tests.
 
-### 1.2 Line parser (`parser.rs`)
+> The original sketch here called for a `notify`-based watcher on a tokio task. That was
+> tried and **rejected** on latency grounds (see Phase 0). Don't revert to it.
 
-Turn raw lines into a typed `enum LazerEvent`:
+### 1.2 Line parser — DONE (different variants than sketched)
+
+The real `LazerEvent` (osu emits a game-wide *working beatmap* line + `GameplayClockContainer`
+lifecycle lines — there is no "entered SoloPlayer" signal in practice):
 
 ```rust
 enum LazerEvent {
-    BeatmapSelected { artist: String, title: String, difficulty: String },
-    GameplayEntered,                  // "entered SoloPlayer"
-    LeadInMs(i64),                    // "GameplayClockContainer seeking to -N"
-    GameplayStopped,                  // "GameplayClockContainer stopped"
+    WorkingBeatmap { artist, title, creator, difficulty },  // "Game-wide working beatmap updated to …"
+    LeadIn(i64),                                             // "GameplayClockContainer seeking to -N"
+    GameplayStarted,                                         // "GameplayClockContainer started …"
+    GameplayStopped,                                         // "GameplayClockContainer stopped …"
     Unrecognized,
 }
 ```
 
-Use the three real log excerpts already collected in this conversation as literal test fixtures (paste them into `#[cfg(test)]` blocks) — parse each line of each fixture and assert the right variant comes out, including the exact artist/title/difficulty split and the correct sign/value of the lead-in.
+Notes vs the sketch: it captures the **creator/mapper** too, and parses
+`"{artist} - {title} ({creator}) [{difficulty}]"` by peeling fields off the right
+(difficulty → creator → split remainder on first `" - "`) so titles/artists containing
+`-`, `(`, `[` still parse. Real log lines are embedded as `#[cfg(test)]` fixtures
+(`parses_working_beatmap`, `parses_working_beatmap_with_tricky_creator`,
+`parses_clock_events`, `ignores_noise_and_header`). All passing.
 
-**Done when:** all three pasted log excerpts parse with zero panics and the expected events extracted, including edge cases already seen (e.g. the aborted-play log where `PlayerLoader` exits back to song select without ever reaching `SoloPlayer`).
+`Follower` holds the cross-line state (last working beatmap + pending lead-in) and turns
+the event stream into `LiveSignal::Start { artist, title, difficulty, started_at, lead_in_ms }`
+/ `LiveSignal::Stop`, which `lib.rs` consumes.
 
-**Non-goals:** don't try to handle multiplayer or non-`SoloPlayer` screen names yet — `Unrecognized` is an acceptable catch-all for now.
+**Non-goals (still true):** no multiplayer / non-solo screens — `Unrecognized` catch-all is fine.
 
 ---
 
@@ -209,13 +270,18 @@ source — mania is per-column, so match a press to its column's notes (map the 
 
 ## Phase 7 — Overlay rendering
 
-### 7.1 Event bridge to frontend
+### 7.1 Event bridge to frontend  *(status: DONE — reuse, don't rebuild)*
 
-Emit judged-hit events (`error_ms`, timestamp) from Rust to the webview. **This is new
-plumbing** — the app currently uses only `invoke` request/response with no `emit`/`listen`
-anywhere. Use `AppHandle::emit` on the Rust side and `@tauri-apps/plugin`-style
-`listen()` from `@tauri-apps/api/event` on the TS side; the watcher/state machine runs on
-a background task, so pass the `AppHandle` into it.
+⚠️ The `emit`/`listen` plumbing **already exists**. `lib.rs` clones the `AppHandle` into
+the log-tail thread and emits `live-select` (working beatmap changed), `live-play`
+(gameplay start, payload `artist/title/difficulty/start_in_ms/lead_in_ms`), and
+`live-stop`; `src/livesync.ts` uses `listen()` from `@tauri-apps/api/event`. On
+`live-select` it jumps the sidebar/detail to the picked map; on `live-play` it navigates
+there and drives the note chart's own playback (`requestLivePlay`/`startLive` in
+`detail.ts`) so the chart scrolls and plays audio aligned to osu!'s position 0.
+
+Remaining work for this feature: add a judged-hit event (`error_ms`, timestamp) alongside
+these (or extend a payload) once Phase 6 produces judgments — the transport itself is done.
 
 ### 7.2 Visualization widget
 

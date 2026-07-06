@@ -1,47 +1,38 @@
 use anyhow::{Context, Result};
-use rosu_map::section::hit_objects::HitObjectKind;
+use log::info;
+use rosu_map::section::general::GameMode;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-/// osu! lazer stores files content-addressed under its data dir.
-/// macOS: ~/Library/Application Support/osu/files, Linux: ~/.local/share/osu/files.
-fn osu_files_dir() -> PathBuf {
+/// osu! lazer's own per-OS data root: `~/Library/Application Support/osu` /
+/// `~/.local/share/osu` on macOS/Linux; on Windows lazer nests the launcher's
+/// data dir one level deeper than the game's own `osu` folder, so it's a `../`
+/// sibling of `dirs::data_dir()` instead. Every osu!-owned path (the `files/`
+/// store, `logs/`, the realm copy) hangs off this single root.
+pub(crate) fn osu_root_dir() -> PathBuf {
     let base = dirs::data_dir().expect("no data dir");
     #[cfg(windows)]
     {
-        let p = base.join("../osu/files");
-        info!("using osu file path: {}", p.display());
-        p
+        base.join("../osu")
     }
     #[cfg(not(windows))]
     {
-        use log::info;
-
-        let p = base.join("osu").join("files");
-        info!("using osu file path: {}", p.display());
-        p
+        base.join("osu")
     }
 }
 
+/// osu! lazer stores files content-addressed under its data dir.
+fn osu_files_dir() -> PathBuf {
+    let p = osu_root_dir().join("files");
+    info!("using osu files path: {}", p.display());
+    p
+}
+
 pub(crate) fn osu_logs_dir() -> PathBuf {
-    let data_dir = dirs::data_dir().expect("no data dir");
-
-    #[cfg(windows)]
-    {
-        use dirs::data_dir;
-
-        let p = data_dir().join("../osu/logs");
-        info!("using osu file path: {}", p.display());
-        p
-    }
-    #[cfg(not(windows))]
-    {
-        use log::info;
-        let p = data_dir.join("osu").join("logs");
-        info!("using osu file path: {}", p.display());
-        p
-    }
+    let p = osu_root_dir().join("logs");
+    info!("using osu logs path: {}", p.display());
+    p
 }
 
 /// A content hash `abcdef...` lives at `files/a/ab/abcdef...`.
@@ -127,23 +118,33 @@ pub fn read_beatmap_detail(hash: &str) -> Result<BeatmapDetail> {
     let map = rosu_map::Beatmap::from_path(&path)
         .with_context(|| format!("failed to parse {}", path.display()))?;
 
-    let key_count = map.circle_size.round().max(1.0) as u32;
+    // Mania-convert via rosu-pp: a no-op for an already-mania file, a real
+    // osu!std->mania conversion (matching lazer's own algorithm) otherwise —
+    // this is how lazer lets you play any std map as mania. Notes/key-count/
+    // difficulty stats all come from this converted map, not the raw parse
+    // above (which stays around for timing points, unaffected by conversion).
+    let mut pp_map = rosu_pp::Beatmap::from_path(&path)
+        .with_context(|| format!("failed to parse {} for pp", path.display()))?;
+    pp_map
+        .convert_mut(GameMode::Mania, &rosu_pp::GameMods::default())
+        .with_context(|| format!("{} can't convert to mania", path.display()))?;
 
-    let notes = map
+    let key_count = pp_map.cs.round().max(1.0) as u32;
+
+    let notes = pp_map
         .hit_objects
         .iter()
         .filter_map(|obj| match &obj.kind {
-            HitObjectKind::Circle(c) => Some(ManiaNote {
+            rosu_pp::model::hit_object::HitObjectKind::Circle => Some(ManiaNote {
                 start_time: obj.start_time,
-                column: column_for(c.pos.x, key_count),
+                column: column_for(obj.pos.x, key_count),
                 end_time: None,
             }),
-            HitObjectKind::Hold(h) => Some(ManiaNote {
+            rosu_pp::model::hit_object::HitObjectKind::Hold(h) => Some(ManiaNote {
                 start_time: obj.start_time,
-                column: column_for(h.pos_x, key_count),
+                column: column_for(obj.pos.x, key_count),
                 end_time: Some(obj.start_time + h.duration),
             }),
-            // sliders/spinners don't occur in mania; ignore for other modes
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -173,8 +174,9 @@ pub fn read_beatmap_detail(hash: &str) -> Result<BeatmapDetail> {
 
     let bpm = bpm_summary(&timing_points, &map.hit_objects);
 
-    let attrs = rosu_pp::Beatmap::from_path(&path)
-        .map(|m| rosu_pp::Difficulty::new().calculate(&m).stars())
+    let attrs = rosu_pp::Difficulty::new()
+        .calculate_for_mode::<rosu_pp::mania::Mania>(&pp_map)
+        .map(|a| a.stars)
         .unwrap_or(0.0);
 
     // derived stats (kept in Rust)
@@ -207,7 +209,7 @@ pub fn read_beatmap_detail(hash: &str) -> Result<BeatmapDetail> {
         difficulty: DifficultySettings {
             ar: map.approach_rate,
             od: map.overall_difficulty,
-            cs: map.circle_size,
+            cs: pp_map.cs, // converted key count (== key_count) for converts
             hp: map.hp_drain_rate,
             slider_multiplier: map.slider_multiplier,
             slider_tick_rate: map.slider_tick_rate,
@@ -286,8 +288,13 @@ mod tests {
 
     #[test]
     fn reads_mania_beatmap() {
-        let hash = "f5652f3961da1bdd25a37431e46e154661229011ab88cc8ab4913f0abbce999b";
-        let d = read_beatmap_detail(hash).expect("read_beatmap_detail failed");
+        // Resolve a real mania difficulty from whatever's in the local
+        // library instead of hardcoding one machine's beatmap hash.
+        let json = crate::realm::fetch_realm(&crate::realm::get_realm_path())
+            .expect("fetch_realm failed");
+        let hash =
+            crate::realm::first_mania_hash(&json).expect("no mania beatmap in local library");
+        let d = read_beatmap_detail(&hash).expect("read_beatmap_detail failed");
 
         println!(
             "mode={} keys={} notes={} timing_points={} bpm(min={} max={} primary={}) stars={:.2}",
@@ -313,7 +320,7 @@ mod tests {
             d.notes.iter().all(|n| n.column < d.key_count),
             "column out of range"
         );
-        assert!((d.bpm.primary - 170.0).abs() < 1.0, "expected ~170 BPM");
+        assert!(d.bpm.primary > 0.0, "expected a positive primary BPM");
         assert_eq!(
             d.column_counts.len(),
             d.key_count as usize,
@@ -330,5 +337,24 @@ mod tests {
             "column counts sum to notes"
         );
         assert!(d.length_ms > 0.0, "expected positive length");
+    }
+
+    #[test]
+    fn reads_converted_beatmap() {
+        // an osu!standard difficulty auto-converted to mania, so this only
+        // runs meaningfully on a library that has at least one such map.
+        let json = crate::realm::fetch_realm(&crate::realm::get_realm_path())
+            .expect("fetch_realm failed");
+        let hash =
+            crate::realm::first_convert_hash(&json).expect("no convert-eligible beatmap");
+        let d = read_beatmap_detail(&hash).expect("read_beatmap_detail failed");
+
+        assert_eq!(d.mode, "Osu", "source file should be osu!standard");
+        assert!(!d.notes.is_empty(), "expected converted notes");
+        assert!(
+            d.notes.iter().all(|n| n.column < d.key_count),
+            "column out of range"
+        );
+        assert!(d.key_count >= 1, "expected a converted key count");
     }
 }

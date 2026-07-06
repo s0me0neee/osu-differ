@@ -1,38 +1,47 @@
-// Latency test (not a feature): when the live osu! session starts a play, the
-// Rust log tail emits `live-play`; we play the *same* song here, aligned so its
-// position 0 sounds at the same instant osu's audio does. If they're in sync you
-// hear a single sound; any offset is the real osu→app latency (dominated by
-// osu's log-flush delay). `live-stop` halts it.
+// Mirror the live osu! session in the app:
+//  - `live-select` (song pick / preview in song select): jump the sidebar +
+//    detail view to that difficulty.
+//  - `live-play` (gameplay start): jump there AND start the note chart's own
+//    playback in sync, so the chart scrolls and plays audio aligned to osu!'s
+//    audio (position 0 lands at the same instant). `live-stop` halts it.
 
 import { listen } from "@tauri-apps/api/event";
-import { loadAudio } from "./api";
+import { isChartShowing, requestLivePlay, stopLivePlay } from "./detail";
 import type { ManiaDiff, ManiaSet } from "./model";
 
-interface LivePlay {
+// Enough to identify a difficulty in the library. Both live events carry these.
+interface LiveId {
 	artist: string;
 	title: string;
 	difficulty: string;
-	startInMs: number; // ms from emit until song position 0 (negative if passed)
-	leadInMs: number;
 }
 
-let ctx: AudioContext | null = null;
-let current: AudioBufferSourceNode | null = null;
-const decoded = new Map<string, AudioBuffer>(); // audioHash -> buffer
-
-function ensureCtx(): AudioContext {
-	if (!ctx) ctx = new AudioContext();
-	if (ctx.state === "suspended") void ctx.resume();
-	return ctx;
+interface LivePlay extends LiveId {
+	audioZeroEpochMs: number; // Unix epoch ms when song position 0 happens
+	leadInMs: number;
 }
 
 function norm(s: string): string {
 	return s.trim().toLowerCase();
 }
 
+// Browsers/webviews only let audio actually play after a real user gesture.
+// Live-play starts a chart's AudioContext from an IPC event, not a gesture,
+// so without this a chart the user never clicked into stays silently muted.
+// One throwaway context resumed on the first real interaction unlocks audio
+// for the whole page, including AudioContexts created later by live-sync.
+function unlockAudioOnFirstGesture(): void {
+	const unlock = () => {
+		const ctx = new AudioContext();
+		void ctx.resume().finally(() => void ctx.close());
+	};
+	document.addEventListener("pointerdown", unlock, { once: true });
+	document.addEventListener("keydown", unlock, { once: true });
+}
+
 // Match the log's "{artist} - {title} [{difficulty}]" against the loaded library.
 // The log uses romanized metadata; fall back to the unicode title just in case.
-function resolveDiff(sets: ManiaSet[], p: LivePlay): ManiaDiff | undefined {
+function resolveDiff(sets: ManiaSet[], p: LiveId): ManiaDiff | undefined {
 	const a = norm(p.artist);
 	const t = norm(p.title);
 	const d = norm(p.difficulty);
@@ -48,85 +57,43 @@ function resolveDiff(sets: ManiaSet[], p: LivePlay): ManiaDiff | undefined {
 	return undefined;
 }
 
-async function getBuffer(c: AudioContext, hash: string): Promise<AudioBuffer> {
-	const hit = decoded.get(hash);
-	if (hit) return hit;
-	const bytes = await loadAudio(hash);
-	const buf = await c.decodeAudioData(bytes);
-	decoded.set(hash, buf);
-	return buf;
-}
-
-function stop(): void {
-	if (current) {
-		try {
-			current.stop();
-		} catch {
-			/* already stopped */
-		}
-		current = null;
-	}
-}
-
-async function onPlay(
-	p: LivePlay,
-	sets: ManiaSet[],
-	navigate: (diff: ManiaDiff) => void,
-): Promise<void> {
-	const c = ensureCtx();
-	const recvAt = c.currentTime; // audio-clock time we started handling this
-	const diff = resolveDiff(sets, p);
-	if (!diff) {
-		console.warn(`[livesync] no library match for ${p.artist} - ${p.title} [${p.difficulty}]`);
-		return;
-	}
-	// Jump the app to the played difficulty's info page (independent of audio).
-	navigate(diff);
-	if (!diff.audioHash) {
-		console.warn(`[livesync] no audio file for ${p.artist} - ${p.title}`);
-		return;
-	}
-	const buf = await getBuffer(c, diff.audioHash);
-	stop();
-
-	// Compensate for the time spent resolving/decoding since we received the
-	// event, so the schedule still targets the original audio-zero instant.
-	const spent = c.currentTime - recvAt;
-	const startIn = p.startInMs / 1000 - spent;
-
-	const src = c.createBufferSource();
-	src.buffer = buf;
-	src.connect(c.destination);
-	if (startIn >= 0) {
-		src.start(c.currentTime + startIn, 0); // wait, then play from the top
-	} else {
-		// audio-zero already passed: jump into the track by that much
-		src.start(c.currentTime, Math.min(-startIn, buf.duration));
-	}
-	current = src;
-	console.info(
-		`[livesync] ${p.artist} - ${p.title} [${p.difficulty}] — scheduled in ${(startIn * 1000).toFixed(1)}ms (lead-in ${p.leadInMs}ms)`,
-	);
-}
-
 /**
- * Wire up the live-sync latency test. `getSets` returns the loaded library;
- * `navigate` jumps the app UI to the played difficulty's info page.
+ * Wire up live sync. `getSets` returns the loaded library; `navigate` jumps the
+ * app UI to a difficulty's info page (which renders its note chart).
  */
 export function initLiveSync(
 	getSets: () => ManiaSet[],
 	navigate: (diff: ManiaDiff) => void,
 ): void {
-	// AudioContext often starts suspended until a user gesture; unlock on first click.
-	document.addEventListener(
-		"pointerdown",
-		() => {
-			ensureCtx();
-		},
-		{ once: true },
-	);
-	void listen<LivePlay>("live-play", (e) => {
-		void onPlay(e.payload, getSets(), navigate);
+	unlockAudioOnFirstGesture();
+
+	// Song pick in song select: jump the app to that difficulty (no audio).
+	void listen<LiveId>("live-select", (e) => {
+		const p = e.payload;
+		const diff = resolveDiff(getSets(), p);
+		if (diff) navigate(diff);
+		else console.warn(`[livesync] no library match for pick ${p.artist} - ${p.title} [${p.difficulty}]`);
 	});
-	void listen("live-stop", () => stop());
+
+	// Gameplay start: jump to the map, then start its note chart in sync.
+	// audioZeroEpochMs is passed straight through — detail.ts converts it
+	// directly to the AudioContext clock at the last possible moment.
+	void listen<LivePlay>("live-play", (e) => {
+		const p = e.payload;
+		const diff = resolveDiff(getSets(), p);
+		if (!diff) {
+			console.warn(`[livesync] no library match for play ${p.artist} - ${p.title} [${p.difficulty}]`);
+			return;
+		}
+		// a resume re-fires live-play for the same difficulty — skip
+		// navigating so it re-syncs the existing chart instead of tearing
+		// it down and re-decoding its audio from scratch.
+		if (!isChartShowing(diff.hash)) navigate(diff);
+		requestLivePlay(diff.hash, p.audioZeroEpochMs);
+		console.info(
+			`[livesync] ▶ ${p.artist} - ${p.title} [${p.difficulty}] — audio-zero in ${(p.audioZeroEpochMs - Date.now()).toFixed(1)}ms (lead-in ${p.leadInMs}ms)`,
+		);
+	});
+
+	void listen("live-stop", () => stopLivePlay());
 }

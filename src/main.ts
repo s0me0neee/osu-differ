@@ -3,15 +3,12 @@ import { loadBeatmap, loadManiaLibrary } from "./api";
 import { renderDetail } from "./detail";
 import { initLiveSync } from "./livesync";
 import { renderSidebar } from "./sidebar";
+import { invoke } from '@tauri-apps/api/core';
 import type { ManiaSet } from "./model";
-
-const REALM_PATH =
-	"/Users/maot27/Library/Application Support/osu/client.realm.copy";
 
 async function boot() {
 	const sidebar = document.getElementById("sidebar")!;
 	const detail = document.getElementById("detail")!;
-
 	detail.innerHTML = `<div class="placeholder">Select a difficulty to view its stats.</div>`;
 
 	// Live-sync latency test: play whatever the live osu! session plays and jump
@@ -25,15 +22,23 @@ async function boot() {
 	);
 
 	try {
-		sets = await loadManiaLibrary(REALM_PATH);
+		const realmPath: string = await invoke("get_realm_path");
+		sets = await loadManiaLibrary(realmPath);
 		info(`loaded ${sets.length} mania sets`);
 
+		// Guards against overlapping selections (e.g. a duplicate live-play):
+		// only the most recent one is allowed to touch the UI, so a late,
+		// out-of-order response can't clobber a newer selection.
+		let selectionSeq = 0;
 		const handle = renderSidebar(sidebar, sets, async (diff) => {
+			const seq = ++selectionSeq;
 			detail.innerHTML = `<div class="placeholder">Loading ${diff.name}…</div>`;
 			try {
 				const d = await loadBeatmap(diff.hash);
+				if (seq !== selectionSeq) return; // superseded
 				renderDetail(detail, diff, d);
 			} catch (e) {
+				if (seq !== selectionSeq) return;
 				detail.innerHTML = `<div class="placeholder error">Failed to parse map: ${String(e)}</div>`;
 			}
 		});
@@ -44,4 +49,9 @@ async function boot() {
 	}
 }
 
-window.addEventListener("DOMContentLoaded", boot, { once: true });
+
+boot()
+// For some reason DOMContentLoaded dosen't work on linux
+// window.addEventListener("DOMContentLoaded", () => {
+// 	boot()
+// });

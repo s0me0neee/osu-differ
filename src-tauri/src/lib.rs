@@ -4,17 +4,28 @@ mod realm;
 
 use tauri::Emitter;
 
-/// Payload for the `live-play` event: what the live osu! session just started,
-/// plus how many ms from *emit* until the song reaches position 0 (negative if
-/// that instant already passed). The frontend uses this to play the same song in
-/// sync — a manual latency check, not a shipped feature.
+/// Payload for the `live-select` event: the beatmap the live osu! session just
+/// made its game-wide working beatmap (i.e. what the player currently has picked
+/// in song select). The frontend uses this to jump to that difficulty.
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveSelect {
+    artist: String,
+    title: String,
+    difficulty: String,
+}
+
+/// Payload for the `live-play` event: an absolute wall-clock epoch-ms timestamp
+/// for when the song reaches position 0 (not "ms from now" — the frontend is a
+/// different process/clock, so a relative value would bake in IPC transit time).
+/// A manual latency check, not a shipped feature.
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LivePlay {
     artist: String,
     title: String,
     difficulty: String,
-    start_in_ms: f64,
+    audio_zero_epoch_ms: f64,
     lead_in_ms: i64,
 }
 
@@ -37,24 +48,34 @@ pub fn run() {
             std::thread::spawn(move || {
                 let dir = beatmap::osu_logs_dir();
                 lazer_log::follow_forever(&dir, move |sig| match sig {
+                    lazer_log::LiveSignal::Select(s) => {
+                        // The player picked (or previewed) a map in song select —
+                        // tell the frontend to jump to it.
+                        let _ = handle.emit(
+                            "live-select",
+                            LiveSelect {
+                                artist: s.artist,
+                                title: s.title,
+                                difficulty: s.difficulty,
+                            },
+                        );
+                    }
                     lazer_log::LiveSignal::Start(s) => {
-                        // Audio position 0 is reached |lead_in| ms after the
-                        // gameplay clock starts; express that as ms-from-now.
-                        let lead = s.lead_in_ms.unwrap_or(0).unsigned_abs();
-                        let audio_zero = s.started_at + std::time::Duration::from_millis(lead);
-                        let now = std::time::Instant::now();
-                        let start_in_ms = if audio_zero >= now {
-                            audio_zero.duration_since(now).as_secs_f64() * 1000.0
-                        } else {
-                            -(now.duration_since(audio_zero).as_secs_f64() * 1000.0)
-                        };
+                        // fires on the session's first start and every resume;
+                        // audio_zero is already resume-adjusted by lazer_log.
+                        let audio_zero_epoch_ms = s
+                            .audio_zero
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64()
+                            * 1000.0;
                         let _ = handle.emit(
                             "live-play",
                             LivePlay {
                                 artist: s.artist,
                                 title: s.title,
                                 difficulty: s.difficulty,
-                                start_in_ms,
+                                audio_zero_epoch_ms,
                                 lead_in_ms: s.lead_in_ms.unwrap_or(0),
                             },
                         );
@@ -69,6 +90,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             realm::read_realm,
             realm::read_mania_library,
+            realm::get_realm_path,
             beatmap::read_beatmap,
             beatmap::read_audio
         ])

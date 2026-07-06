@@ -454,6 +454,16 @@ body {
 .chart-speed:focus {
 	border-color: var(--accent-dim);
 }
+/* hide the number-input spinner arrows */
+.chart-speed::-webkit-inner-spin-button,
+.chart-speed::-webkit-outer-spin-button {
+	appearance: none;
+	margin: 0;
+}
+.chart-speed {
+	-moz-appearance: textfield;
+	appearance: textfield;
+}
 
 .chart-body {
 	position: relative;

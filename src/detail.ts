@@ -31,6 +31,40 @@ function statCard(label: string, value: string): HTMLElement {
 }
 
 let currentChart: ChartHandle | null = null;
+let currentChartHash: string | null = null; // hash currentChart renders, if any
+// A live-play whose target chart hasn't rendered yet (navigate() re-renders
+// async). Held until a matching renderDetail fires it, unless it's gone stale
+// (the beatmap load that should have delivered it failed).
+let pendingLivePlay: { hash: string; audioZeroEpochMs: number; requestedAt: number } | null = null;
+const LIVE_REQUEST_STALE_MS = 10_000;
+
+/** Whether `hash`'s chart is already the one on screen — e.g. a pause/resume
+ * re-syncs the same difficulty, not a new selection. Callers use this to skip
+ * re-navigating (which would tear down and re-decode the existing chart). */
+export function isChartShowing(hash: string): boolean {
+	return currentChartHash === hash && currentChart != null;
+}
+
+/** Start (or queue) a live-synced play for `hash`. `audioZeroEpochMs` is a
+ * Unix epoch ms timestamp (not perf/AudioContext time) — each side converts
+ * it into its own clock right when it's used, so IPC/queueing delay can't
+ * bias the schedule. If `hash`'s chart is already showing, starts it
+ * immediately instead of queuing (a pause/resume shouldn't wait on a
+ * navigate() that isn't going to happen). */
+export function requestLivePlay(hash: string, audioZeroEpochMs: number): void {
+	if (isChartShowing(hash)) {
+		currentChart!.startLive(audioZeroEpochMs);
+		return;
+	}
+	pendingLivePlay = { hash, audioZeroEpochMs, requestedAt: performance.now() };
+}
+
+/** Stop any live-synced playback (gameplay ended / quit). */
+export function stopLivePlay(): void {
+	pendingLivePlay = null;
+	currentChart?.stopLive();
+}
+
 // chart preferences that persist across beatmap changes.
 // prefScrollSpeed = null means "use each map's density-based default".
 let prefScrollSpeed: number | null = null;
@@ -44,6 +78,7 @@ export function renderDetail(
 ): void {
 	currentChart?.destroy(); // stop the previous chart's audio/loops
 	currentChart = null;
+	currentChartHash = null;
 	container.textContent = "";
 	const meta = diff.meta;
 
@@ -113,6 +148,19 @@ export function renderDetail(
 	// note chart fills the right column, top to bottom
 	const chart = noteChart(d, diff);
 	currentChart = chart;
+	currentChartHash = diff.hash;
+	// a live-play arrived before this chart existed — start it now that it does,
+	// unless it's been stuck long enough that it's clearly a stale leftover from
+	// a failed load rather than this navigation's own live-play.
+	if (pendingLivePlay?.hash === diff.hash) {
+		const { audioZeroEpochMs, requestedAt } = pendingLivePlay;
+		pendingLivePlay = null;
+		if (performance.now() - requestedAt <= LIVE_REQUEST_STALE_MS) {
+			chart.startLive(audioZeroEpochMs);
+		} else {
+			console.warn(`[livesync] dropping stale queued live-play for ${diff.hash}`);
+		}
+	}
 
 	// timing points — clicking scrolls the chart there; ramps highlight their span
 	left.appendChild(sectionTitle(`Timing points (${d.timing_points.length})`));
@@ -260,6 +308,8 @@ interface ChartHandle {
 	scrollToTime: (t: number) => void;
 	highlight: (from: number, to: number) => void;
 	clearHighlight: () => void;
+	startLive: (audioZeroEpochMs: number) => void;
+	stopLive: () => void;
 	destroy: () => void;
 }
 
@@ -297,9 +347,9 @@ function noteChart(d: BeatmapDetail, diff: ManiaDiff): ChartHandle {
 	gaps.sort((a, b) => a - b);
 	const denseGap = gaps.length ? gaps[Math.floor(gaps.length * 0.05)] : 400;
 	const primaryBeatLen = d.bpm.primary > 0 ? 60000 / d.bpm.primary : 500;
-	const densityDefault = Math.max(
-		1,
-		Math.round((DEFAULT_DENSE_PX * primaryBeatLen) / (BEAT_PX * denseGap)),
+	const densityDefault = Math.min(
+		550,
+		Math.max(1, Math.round((DEFAULT_DENSE_PX * primaryBeatLen) / (BEAT_PX * denseGap))),
 	);
 
 	let vScroll = prefScrollSpeed ?? densityDefault; // user override, else per-map default
@@ -486,6 +536,15 @@ function noteChart(d: BeatmapDetail, diff: ManiaDiff): ChartHandle {
 	let rafPlay = 0;
 	let hitSound = prefHitSound; // play a tick as notes reach the receptor
 	let hitCursor = 0; // next note in notesByStart not yet ticked
+	// a live-sync start requested before audio finished decoding (epoch ms of
+	// song position 0); replayed once songBuf is ready.
+	let pendingLive: number | null = null;
+	let audioUnavailable = false; // no audioHash, or decode failed — startLive can never proceed
+	let destroyed = false; // this chart was torn down; ignore any late async callbacks
+	// whether the *current* (or most recently started) playback was driven by
+	// live-sync vs. the user's own Play button — so a `live-stop` only stops
+	// playback it actually started, not an unrelated manual preview.
+	let liveOwned = false;
 
 	const laneX = (c: number) => offsetX + GUTTER + c * LANE_W;
 	const yFull = (t: number) => virtualH - BOT_PAD - vScroll * unitD(t); // bottom = start
@@ -832,7 +891,7 @@ function noteChart(d: BeatmapDetail, diff: ManiaDiff): ChartHandle {
 		filter.frequency.value = 2200;
 		filter.Q.value = 0.8;
 		const gain = ctx.createGain();
-		gain.gain.setValueAtTime(3.5, when);
+		gain.gain.setValueAtTime(3.8, when);
 		gain.gain.exponentialRampToValueAtTime(0.001, when + 0.045);
 		src.connect(filter).connect(gain).connect(ctx.destination);
 		src.start(when);
@@ -886,7 +945,11 @@ function noteChart(d: BeatmapDetail, diff: ManiaDiff): ChartHandle {
 		cancelAnimationFrame(rafPlay);
 		draw();
 	}
-	function startPlay(offsetSec: number): void {
+	// Begin playback from song position `offsetSec`. `whenCtx` (an AudioContext
+	// clock time) lets the caller schedule the start in the future — used by live
+	// sync to begin exactly when osu!'s audio reaches position 0. Until then
+	// `stepPlay` computes a negative `playMs` and the chart holds at the start.
+	function startPlay(offsetSec: number, whenCtx?: number): void {
 		const ctx = ensureCtx();
 		if (!songBuf || !songGain) return;
 		if (ctx.state === "suspended") ctx.resume();
@@ -895,7 +958,7 @@ function noteChart(d: BeatmapDetail, diff: ManiaDiff): ChartHandle {
 		src.buffer = songBuf;
 		src.connect(songGain);
 		const off = Math.max(0, Math.min(offsetSec, songBuf.duration));
-		const when = ctx.currentTime;
+		const when = Math.max(ctx.currentTime, whenCtx ?? ctx.currentTime);
 		songSrc = src;
 		songStartCtx = when;
 		songStartOff = off;
@@ -912,25 +975,74 @@ function noteChart(d: BeatmapDetail, diff: ManiaDiff): ChartHandle {
 		cancelAnimationFrame(rafPlay);
 		rafPlay = requestAnimationFrame(stepPlay);
 	}
+	// Start playing in sync with the live osu! session. `audioZeroEpochMs` is a
+	// Unix epoch ms timestamp (may be in the past if gameplay already began).
+	// Converted straight to the AudioContext clock here, at the last possible
+	// moment — one clock hop instead of relaying through performance.now().
+	// If the audio is still decoding, defer.
+	function startLive(audioZeroEpochMs: number): void {
+		if (destroyed) return; // chart was torn down before this fired
+		if (audioUnavailable) {
+			console.warn(`[livesync] no usable audio for ${diff.name} — cannot start in sync`);
+			return;
+		}
+		if (!songBuf) {
+			pendingLive = audioZeroEpochMs; // replayed from the decode handler
+			return;
+		}
+		const ctx = ensureCtx();
+		if (ctx.state === "suspended") {
+			// not a user gesture, so the browser may refuse to actually resume —
+			// surface that instead of silently staying muted.
+			void ctx.resume().then(
+				() => {
+					if (ctx.state !== "running") {
+						console.warn(`[livesync] AudioContext still ${ctx.state} for ${diff.name} — click anywhere in the app once to enable audio sync`);
+					}
+				},
+				(e) => console.warn(`[livesync] AudioContext.resume() rejected for ${diff.name}:`, e),
+			);
+		}
+		const audioZeroCtx = ctx.currentTime + (audioZeroEpochMs - Date.now()) / 1000;
+		const offNow = ctx.currentTime - audioZeroCtx; // seconds into the song right now
+		liveOwned = true;
+		if (offNow >= 0) startPlay(offNow); // gameplay already running: jump in
+		else startPlay(0, audioZeroCtx); // schedule the start at audio-zero
+	}
 	function togglePlay(): void {
 		if (!songBuf) return;
 		if (playing) stopPlay();
-		else startPlay(timeAtReceptor() / 1000); // play from the receptor
+		else {
+			liveOwned = false; // user-initiated: a live-stop must not touch this
+			startPlay(timeAtReceptor() / 1000); // play from the receptor
+		}
 	}
 	if (diff.audioHash) {
 		playBtn.title = "loading audio…";
 		loadAudio(diff.audioHash)
 			.then((buf) => ensureCtx().decodeAudioData(buf))
 			.then((decoded) => {
+				if (destroyed) return; // chart was torn down while decoding
 				songBuf = decoded;
 				playBtn.disabled = false;
 				playBtn.title = "";
+				if (pendingLive != null) {
+					const at = pendingLive;
+					pendingLive = null;
+					startLive(at); // a live start arrived while we were decoding
+				}
 			})
 			.catch(() => {
 				playBtn.title = "audio unavailable";
+				audioUnavailable = true;
+				if (pendingLive != null) {
+					console.warn(`[livesync] audio decode failed for ${diff.name} — dropping pending live-sync start`);
+					pendingLive = null;
+				}
 			});
 	} else {
 		playBtn.title = "no audio file";
+		audioUnavailable = true;
 	}
 	playBtn.addEventListener("click", togglePlay);
 	hitBtn.addEventListener("click", () => {
@@ -1001,6 +1113,8 @@ function noteChart(d: BeatmapDetail, diff: ManiaDiff): ChartHandle {
 		requestDraw();
 	}
 	function destroy(): void {
+		destroyed = true;
+		pendingLive = null;
 		playing = false;
 		cancelAnimationFrame(rafPlay);
 		stopSource();
@@ -1009,5 +1123,10 @@ function noteChart(d: BeatmapDetail, diff: ManiaDiff): ChartHandle {
 		ro.disconnect();
 	}
 
-	return { el: panel, scrollToTime, highlight, clearHighlight, destroy };
+	const stopLive = (): void => {
+		pendingLive = null;
+		if (playing && liveOwned) stopPlay(); // don't touch an unrelated manual preview
+	};
+
+	return { el: panel, scrollToTime, highlight, clearHighlight, startLive, stopLive, destroy };
 }

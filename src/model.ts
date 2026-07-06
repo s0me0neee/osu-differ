@@ -13,6 +13,10 @@ export interface ManiaDiff {
 	name: string;
 	stars: number;
 	keyCount: number;
+	// true for an auto-converted (osu!std->mania) diff. keyCount/stars here
+	// are the original std beatmap's, not the converted ones — the real
+	// values only get computed on demand when the difficulty is opened.
+	isConvert: boolean;
 	audioHash?: string; // content hash of the song's audio file, if resolvable
 	audioFile?: string; // audio filename (for MIME), e.g. "audio.mp3"
 	meta: DiffMeta;
